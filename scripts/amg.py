@@ -12,166 +12,172 @@ import argparse
 import json
 import os
 from typing import Any, Dict, List
+import numpy as np
+from tifffile import imread, imwrite
+from skimage.util import img_as_ubyte, img_as_uint
+import torch
+from time import time 
 
-parser = argparse.ArgumentParser(
+class ChannelException(Exception):
+    """Raise for trying to run the model on a multi-channel tiff without providing the channel that should be used."""
+
+def convert_annotations_to_labels(anns):
+    if len(anns) == 0:
+        return
+    sorted_anns = sorted(anns, key=(lambda x: x['area']), reverse=True)
+
+    labels = np.zeros_like(sorted_anns[0]['segmentation'], dtype='uint8')
+    for i, ann in enumerate(sorted_anns):
+        mask = ann['segmentation']
+        labels[mask] = i
+    return labels
+
+def load_image(image_path, channel = None):
+
+    image = imread(image_path)
+    if image.ndim > 2 and channel is None:
+        raise ChannelException("When providing a multi-channel tiff, you need to specify which channel you want to run the model on using the argument --channel")
+    elif image.ndim > 2:
+        image = image[channel, ...] #type:ignore
+    image_norm = img_as_uint(image/np.max(image))
+    clahe = cv2.createCLAHE(clipLimit=8, tileGridSize=(8,8))
+    image = img_as_ubyte(clahe.apply(image_norm))
+
+    image = np.expand_dims(image, axis=2)
+    image = np.repeat(image, 3, axis=2)
+    return image
+
+def get_args():
+    parser = argparse.ArgumentParser(
     description=(
         "Runs automatic mask generation on an input image or directory of images, "
-        "and outputs masks as either PNGs or COCO-style RLEs. Requires open-cv, "
-        "as well as pycocotools if saving in RLE format."
+        "and outputs masks as label images."
     )
-)
+    )
 
-parser.add_argument(
-    "--input",
-    type=str,
-    required=True,
-    help="Path to either a single input image or folder of images.",
-)
+    parser.add_argument(
+        "--input",
+        type=str,
+        required=True,
+        help="Path to either a single input image or folder of images.",
+    )
 
-parser.add_argument(
-    "--output",
-    type=str,
-    required=True,
-    help=(
-        "Path to the directory where masks will be output. Output will be either a folder "
-        "of PNGs per image or a single json with COCO-style masks."
-    ),
-)
+    parser.add_argument(
+        "--output",
+        type=str,
+        required=True,
+        help=(
+            "Path to the directory where masks will be output."
+        ),
+    )
 
-parser.add_argument(
-    "--model-type",
-    type=str,
-    required=True,
-    help="The type of model to load, in ['default', 'vit_h', 'vit_l', 'vit_b']",
-)
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        required=True,
+        help="The type of model to load, in ['default', 'vit_h', 'vit_l', 'vit_b']",
+    )
 
-parser.add_argument(
-    "--checkpoint",
-    type=str,
-    required=True,
-    help="The path to the SAM checkpoint to use for mask generation.",
-)
-
-parser.add_argument("--device", type=str, default="cuda", help="The device to run generation on.")
-
-parser.add_argument(
-    "--convert-to-rle",
-    action="store_true",
-    help=(
-        "Save masks as COCO RLEs in a single json instead of as a folder of PNGs. "
-        "Requires pycocotools."
-    ),
-)
-
-amg_settings = parser.add_argument_group("AMG Settings")
-
-amg_settings.add_argument(
-    "--points-per-side",
-    type=int,
-    default=None,
-    help="Generate masks by sampling a grid over the image with this many points to a side.",
-)
-
-amg_settings.add_argument(
-    "--points-per-batch",
-    type=int,
-    default=None,
-    help="How many input points to process simultaneously in one batch.",
-)
-
-amg_settings.add_argument(
-    "--pred-iou-thresh",
-    type=float,
-    default=None,
-    help="Exclude masks with a predicted score from the model that is lower than this threshold.",
-)
-
-amg_settings.add_argument(
-    "--stability-score-thresh",
-    type=float,
-    default=None,
-    help="Exclude masks with a stability score lower than this threshold.",
-)
-
-amg_settings.add_argument(
-    "--stability-score-offset",
-    type=float,
-    default=None,
-    help="Larger values perturb the mask more when measuring stability score.",
-)
-
-amg_settings.add_argument(
-    "--box-nms-thresh",
-    type=float,
-    default=None,
-    help="The overlap threshold for excluding a duplicate mask.",
-)
-
-amg_settings.add_argument(
-    "--crop-n-layers",
-    type=int,
-    default=None,
-    help=(
-        "If >0, mask generation is run on smaller crops of the image to generate more masks. "
-        "The value sets how many different scales to crop at."
-    ),
-)
-
-amg_settings.add_argument(
-    "--crop-nms-thresh",
-    type=float,
-    default=None,
-    help="The overlap threshold for excluding duplicate masks across different crops.",
-)
-
-amg_settings.add_argument(
-    "--crop-overlap-ratio",
-    type=int,
-    default=None,
-    help="Larger numbers mean image crops will overlap more.",
-)
-
-amg_settings.add_argument(
-    "--crop-n-points-downscale-factor",
-    type=int,
-    default=None,
-    help="The number of points-per-side in each layer of crop is reduced by this factor.",
-)
-
-amg_settings.add_argument(
-    "--min-mask-region-area",
-    type=int,
-    default=None,
-    help=(
-        "Disconnected mask regions or holes with area smaller than this value "
-        "in pixels are removed by postprocessing."
-    ),
-)
+    parser.add_argument(
+        "--channel",
+        type=int,
+        help="Choose the channel to run the segmentation on. Required if working with multi-channel tiff files.",
+    )
 
 
-def write_masks_to_folder(masks: List[Dict[str, Any]], path: str) -> None:
-    header = "id,area,bbox_x0,bbox_y0,bbox_w,bbox_h,point_input_x,point_input_y,predicted_iou,stability_score,crop_box_x0,crop_box_y0,crop_box_w,crop_box_h"  # noqa
-    metadata = [header]
-    for i, mask_data in enumerate(masks):
-        mask = mask_data["segmentation"]
-        filename = f"{i}.png"
-        cv2.imwrite(os.path.join(path, filename), mask * 255)
-        mask_metadata = [
-            str(i),
-            str(mask_data["area"]),
-            *[str(x) for x in mask_data["bbox"]],
-            *[str(x) for x in mask_data["point_coords"][0]],
-            str(mask_data["predicted_iou"]),
-            str(mask_data["stability_score"]),
-            *[str(x) for x in mask_data["crop_box"]],
-        ]
-        row = ",".join(mask_metadata)
-        metadata.append(row)
-    metadata_path = os.path.join(path, "metadata.csv")
-    with open(metadata_path, "w") as f:
-        f.write("\n".join(metadata))
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="The path to the SAM checkpoint to use for mask generation.",
+    )
 
-    return
+    amg_settings = parser.add_argument_group("AMG Settings")
+
+    amg_settings.add_argument(
+        "--points-per-side",
+        type=int,
+        default=None,
+        help="Generate masks by sampling a grid over the image with this many points to a side.",
+    )
+
+    amg_settings.add_argument(
+        "--points-per-batch",
+        type=int,
+        default=None,
+        help="How many input points to process simultaneously in one batch.",
+    )
+
+    amg_settings.add_argument(
+        "--pred-iou-thresh",
+        type=float,
+        default=None,
+        help="Exclude masks with a predicted score from the model that is lower than this threshold.",
+    )
+
+    amg_settings.add_argument(
+        "--stability-score-thresh",
+        type=float,
+        default=None,
+        help="Exclude masks with a stability score lower than this threshold.",
+    )
+
+    amg_settings.add_argument(
+        "--stability-score-offset",
+        type=float,
+        default=None,
+        help="Larger values perturb the mask more when measuring stability score.",
+    )
+
+    amg_settings.add_argument(
+        "--box-nms-thresh",
+        type=float,
+        default=None,
+        help="The overlap threshold for excluding a duplicate mask.",
+    )
+
+    amg_settings.add_argument(
+        "--crop-n-layers",
+        type=int,
+        default=None,
+        help=(
+            "If >0, mask generation is run on smaller crops of the image to generate more masks. "
+            "The value sets how many different scales to crop at."
+        ),
+    )
+
+    amg_settings.add_argument(
+        "--crop-nms-thresh",
+        type=float,
+        default=None,
+        help="The overlap threshold for excluding duplicate masks across different crops.",
+    )
+
+    amg_settings.add_argument(
+        "--crop-overlap-ratio",
+        type=int,
+        default=None,
+        help="Larger numbers mean image crops will overlap more.",
+    )
+
+    amg_settings.add_argument(
+        "--crop-n-points-downscale-factor",
+        type=int,
+        default=None,
+        help="The number of points-per-side in each layer of crop is reduced by this factor.",
+    )
+
+    amg_settings.add_argument(
+        "--min-mask-region-area",
+        type=int,
+        default=None,
+        help=(
+            "Disconnected mask regions or holes with area smaller than this value "
+            "in pixels are removed by postprocessing."
+        ),
+    )
+
+    return parser.parse_args()
 
 
 def get_amg_kwargs(args):
@@ -194,12 +200,12 @@ def get_amg_kwargs(args):
 
 def main(args: argparse.Namespace) -> None:
     print("Loading model...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     sam = sam_model_registry[args.model_type](checkpoint=args.checkpoint)
-    _ = sam.to(device=args.device)
-    output_mode = "coco_rle" if args.convert_to_rle else "binary_mask"
+    _ = sam.to(device=device)
     amg_kwargs = get_amg_kwargs(args)
-    generator = SamAutomaticMaskGenerator(sam, output_mode=output_mode, **amg_kwargs)
-
+    generator = SamAutomaticMaskGenerator(sam, **amg_kwargs)
+    channel = args.channel
     if not os.path.isdir(args.input):
         targets = [args.input]
     else:
@@ -212,27 +218,23 @@ def main(args: argparse.Namespace) -> None:
 
     for t in targets:
         print(f"Processing '{t}'...")
-        image = cv2.imread(t)
+        start_time = time()
+        image = load_image(t, channel)
         if image is None:
             print(f"Could not load '{t}' as an image, skipping...")
             continue
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         masks = generator.generate(image)
+        labels = convert_annotations_to_labels(masks)
 
         base = os.path.basename(t)
-        base = os.path.splitext(base)[0]
-        save_base = os.path.join(args.output, base)
-        if output_mode == "binary_mask":
-            os.makedirs(save_base, exist_ok=False)
-            write_masks_to_folder(masks, save_base)
-        else:
-            save_file = save_base + ".json"
-            with open(save_file, "w") as f:
-                json.dump(masks, f)
+        savename = os.path.join(args.output, base)
+
+        imwrite(savename, labels, compression = "zlib")
+        print(f'Done in {time() - start_time} s')
     print("Done!")
 
 
 if __name__ == "__main__":
-    args = parser.parse_args()
+    args = get_args()
     main(args)
