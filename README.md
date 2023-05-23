@@ -19,7 +19,7 @@ source ~/env_directory/segment_anything/bin/activate
 Download the code
 
 ```bash
-git clone git@github.com:spsalmon/segment-anything-for-towbinlab.git
+git clone git@github.com:spsalmon/sam-towbin-lab.git
 ```
 
 Install segment-anything
@@ -32,7 +32,7 @@ pip3 install -e .
 Install the required libraries
 
 ```bash
-pip3 install requirements.txt
+pip3 install -r requirements.txt
 ```
 
 Dowload the checkpoint and place it in the models folder, you can find the check point [here](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth)
